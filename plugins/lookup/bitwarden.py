@@ -3,6 +3,7 @@
 # GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
 # SPDX-License-Identifier: GPL-3.0-or-later
 from __future__ import (absolute_import, division, print_function)
+
 __metaclass__ = type
 
 DOCUMENTATION = """
@@ -56,12 +57,21 @@ DOCUMENTATION = """
         description: Pass session key instead of reading from env.
         type: str
         version_added: 8.4.0
+        env:
+          - name: BW_SESSION
       result_count:
         description:
           - Number of results expected for the lookup query. Task will fail if O(result_count)
             is set but does not match the number of query results. Leave empty to skip this check.
         type: int
         version_added: 10.4.0
+      cache_results:
+        description: Cache lookup results to reduce number of bitwarden-cli queries?
+        type: bool
+        version_added: 10.6.0
+        env:
+          - name: ANSIBLE_BITWARDEN_CACHE_RESULTS
+        default: true
 """
 
 EXAMPLES = """
@@ -121,16 +131,130 @@ RETURN = """
     elements: list
 """
 
+import base64
+import hashlib
+import json
+import os
+import tempfile
+import threading
+
+from cryptography.fernet import Fernet, InvalidToken
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from filelock import FileLock
 from subprocess import Popen, PIPE
+from typing import Callable
 
 from ansible.errors import AnsibleError, AnsibleOptionsError
 from ansible.module_utils.common.text.converters import to_bytes, to_text
+from ansible.utils.display import Display
 from ansible.parsing.ajson import AnsibleJSONDecoder
 from ansible.plugins.lookup import LookupBase
+
+display = Display()
 
 
 class BitwardenException(AnsibleError):
     pass
+
+
+# TODO: cache expiry?
+# TODO: document python deps
+class BitwardenCache:
+    _lock = threading.Lock()
+    _instance = None
+    _cache = {}
+    _cache_file = os.path.join(tempfile.gettempdir(), "ansible-bitwarden-cache")
+    _cache_file_lock = None
+    _fernet = None
+
+    def __new__(cls, session: str):
+        if cls._instance is None:
+            with cls._lock:
+                # Another thread could have created the instance
+                # before we acquired the lock. So check that the
+                # instance is still nonexistent.
+                if not cls._instance:
+                    cls._instance = super().__new__(cls)
+                    cls._cache_file_lock = FileLock(cls._cache_file + ".lock", thread_local=False)  # TODO: os.lockf?
+                    cls._fernet = Fernet(
+                        base64.urlsafe_b64encode(
+                            PBKDF2HMAC(
+                                algorithm=hashes.SHA256(),
+                                length=32,
+                                salt=b'',
+                                iterations=1,
+                            ).derive(session.encode())
+                        )
+                    )
+                    cls._load_cache(cls._instance)
+
+        return cls._instance
+
+    def _load_cache(self):
+        """
+        Load cache from file
+        """
+        if os.path.exists(self._cache_file):
+            display.vvv(msg=f"lookup(community.general.bitwarden): Found existing cache file: {self._cache_file}")
+            with self._cache_file_lock:
+                with open(self._cache_file) as cache_file:
+                    try:
+                        self._cache = json.loads(self._fernet.decrypt(cache_file.read()).decode('utf-8'))
+                        display.vvv(
+                            msg=f"lookup(community.general.bitwarden): Loaded cache entries: {self._cache.keys()}")
+                    except InvalidToken:
+                        display.vvv(msg=f"lookup(community.general.bitwarden): Failed to load cache file: InvalidToken "
+                                        f"- This is probably caused by a new BW_SESSION. Cache file will be overridden")
+                    except Exception as e:
+                        display.vvv(msg=f"lookup(community.general.bitwarden): Failed to load cache file: "
+                                        f"{type(e)} {e.args} - Cache file will be overridden")
+
+        else:
+            display.vvv(msg=f"lookup(community.general.bitwarden): Didn't find cache file: {self._cache_file}")
+
+    def _dump_cache(self):
+        """
+        Dump cache to file
+        """
+        display.vvv(msg=f"lookup(community.general.bitwarden): Dumping cache to file")
+        with self._cache_file_lock:
+            with open(self._cache_file, "wb") as cache_file:
+                try:
+                    cache_file.write(self._fernet.encrypt(json.dumps(self._cache).encode('utf-8')))
+                except Exception as e:
+                    display.vvv(msg=f"lookup(community.general.bitwarden): Failed to write cache file: {e}")
+
+    def cached_execution(self, func: Callable, **kwargs):
+        """
+        Will cache the results of func
+        **kwargs will be passed to func as parameters
+
+        :param func: func to cache results from
+        :param kwargs: Parameters for func
+        :return: Cached results of func
+        """
+
+        # use function and kwargs as cache key
+        hash_inputs = kwargs.copy()
+        hash_inputs.update({"_func": func.__name__})
+        hash_inputs = repr(sorted(hash_inputs.items()))
+        key = hashlib.sha256(hash_inputs.encode()).hexdigest()
+
+        if not self._cache.get(key):
+            with self._lock:
+                with self._cache_file_lock:
+                    # reload cache file since it might have been updated by another process
+                    self._load_cache()
+
+                    if not self._cache.get(key):
+                        display.vvv(msg=f"lookup(community.general.bitwarden): not in cache: {hash_inputs} ({key})")
+                        self._cache[key] = func(**kwargs)
+                        self._dump_cache()
+        else:
+            display.vvv(msg=f"lookup(community.general.bitwarden): found in cache: {hash_inputs} ({key})")
+
+        return self._cache.get(key)
 
 
 class Bitwarden(object):
@@ -256,21 +380,10 @@ class Bitwarden(object):
 
 class LookupModule(LookupBase):
 
-    def run(self, terms=None, variables=None, **kwargs):
-        self.set_options(var_options=variables, direct=kwargs)
-        field = self.get_option('field')
-        search_field = self.get_option('search')
-        collection_id = self.get_option('collection_id')
-        collection_name = self.get_option('collection_name')
-        organization_id = self.get_option('organization_id')
-        result_count = self.get_option('result_count')
-        _bitwarden.session = self.get_option('bw_session')
-
+    @staticmethod
+    def _query_bwcli(terms, field, search_field, collection_id, collection_name, organization_id):
         if not _bitwarden.unlocked:
             raise AnsibleError("Bitwarden Vault locked. Run 'bw unlock'.")
-
-        if not terms:
-            terms = [None]
 
         if collection_name and collection_id:
             raise AnsibleOptionsError("'collection_name' and 'collection_id' are mutually exclusive!")
@@ -281,11 +394,39 @@ class LookupModule(LookupBase):
         else:
             collection_ids = [collection_id]
 
-        results = [
+        return [
             _bitwarden.get_field(field, term, search_field, collection_id, organization_id)
             for collection_id in collection_ids
             for term in terms
         ]
+
+    def run(self, terms=None, variables=None, **kwargs):
+        self.set_options(var_options=variables, direct=kwargs)
+        field = self.get_option('field')
+        search_field = self.get_option('search')
+        collection_id = self.get_option('collection_id')
+        collection_name = self.get_option('collection_name')
+        organization_id = self.get_option('organization_id')
+        result_count = self.get_option('result_count')
+        cache_results = self.get_option('cache_results')
+        _bitwarden.session = self.get_option('bw_session')
+
+        if not terms:
+            terms = [None]
+
+        display.vvv(
+            msg=f"lookup(community.general.bitwarden): cache is " + ("enabled" if cache_results else "disabled"))
+
+        query_args = dict(
+            terms=terms,
+            field=field,
+            search_field=search_field,
+            collection_id=collection_id,
+            collection_name=collection_name,
+            organization_id=organization_id
+        )
+        results = BitwardenCache(_bitwarden.session).cached_execution(self._query_bwcli, **query_args) \
+            if cache_results else self._query_bwcli(**query_args)
 
         for result in results:
             if result_count is not None and len(result) != result_count:

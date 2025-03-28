@@ -6,6 +6,7 @@
 from __future__ import (absolute_import, division, print_function)
 __metaclass__ = type
 
+import os
 import re
 from ansible_collections.community.internal_test_tools.tests.unit.compat import unittest
 from ansible_collections.community.internal_test_tools.tests.unit.compat.mock import patch
@@ -230,6 +231,7 @@ class LoggedOutMockBitwarden(MockBitwarden):
 class TestLookupModule(unittest.TestCase):
 
     def setUp(self):
+        os.environ['BW_SESSION'] = "fdadsfklasdjfklasdjflkj"
         self.lookup = lookup_loader.get('community.general.bitwarden')
 
     @patch('ansible_collections.community.general.plugins.lookup.bitwarden._bitwarden', new=MockBitwarden())
@@ -273,10 +275,9 @@ class TestLookupModule(unittest.TestCase):
         with patch("ansible_collections.community.general.plugins.lookup.bitwarden._bitwarden", mock_bitwarden):
             record = MOCK_RECORDS[0]
             record_name = record['name']
-            session = 'session'
 
             self.lookup.run([record_name], field=None)
-            self.assertIsNone(mock_bitwarden.session)
+            self.assertEqual(mock_bitwarden.session, os.environ['BW_SESSION'])
 
     def test_bitwarden_plugin_session_option(self):
         mock_bitwarden = MockBitwarden()
@@ -330,3 +331,5 @@ class TestLookupModule(unittest.TestCase):
         self.lookup.run(None, organization_id=MOCK_ORGANIZATION_ID, result_count=3)
         with self.assertRaises(BitwardenException):
             self.lookup.run(None, organization_id=MOCK_ORGANIZATION_ID, result_count=0)
+
+    # TODO: add tests for caching
