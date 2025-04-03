@@ -417,6 +417,9 @@ class LookupModule(LookupBase):
         display.vvv(
             msg=f"lookup(community.general.bitwarden): cache is " + ("enabled" if cache_results else "disabled"))
 
+        if not _bitwarden.session:
+            raise AnsibleError("No bitwarden session provided!")
+
         query_args = dict(
             terms=terms,
             field=field,

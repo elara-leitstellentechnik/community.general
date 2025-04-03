@@ -5,7 +5,7 @@
 
 namespace: community
 name: general
-version: 10.6.0-elara.0
+version: 10.6.0-elara.1
 readme: README.md
 authors:
   - Ansible (https://github.com/ansible)
